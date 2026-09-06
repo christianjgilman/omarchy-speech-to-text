@@ -48,6 +48,8 @@ decode_lock = threading.Lock()  # SenseVoice decode is not thread-safe
 
 SOCK_PATH = os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "dictationd.sock")
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+CUSTOM_WORDS_PATH = os.path.expanduser("~/.config/dictationd/custom-words.json")
 
 
 def log(*a):
@@ -153,6 +155,33 @@ MAX_SEGMENT_WINDOWS = int(MAX_SEGMENT_S * SAMPLE_RATE / vad_window)
 log("models ready")
 
 
+def load_custom_words():
+    """Return the replacements list ([{from,to}, ...]); missing file = empty."""
+    try:
+        with open(CUSTOM_WORDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        words = data.get("replacements", [])
+        return [w for w in words if w.get("from") and w.get("to")]
+    except Exception:
+        return []
+
+
+def save_custom_words(words):
+    os.makedirs(os.path.dirname(CUSTOM_WORDS_PATH), exist_ok=True)
+    with open(CUSTOM_WORDS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"replacements": words}, f, ensure_ascii=False, indent=1)
+
+
+def apply_custom_words(text):
+    words = load_custom_words()
+    if not text or not words:
+        return text
+    # longest match first so longer phrases win over their prefixes
+    for w in sorted(words, key=lambda w: len(w["from"]), reverse=True):
+        text = re.sub(re.escape(w["from"]), w["to"], text, flags=re.IGNORECASE)
+    return text
+
+
 def decode_windows(windows):
     """Offline-decode concatenated float32 windows; returns styled text."""
     if not windows:
@@ -164,7 +193,7 @@ def decode_windows(windows):
         s = rec.create_stream()
         s.accept_waveform(SAMPLE_RATE, audio.tolist())
         rec.decode_stream(s)
-        return s.result.text.strip()
+        return apply_custom_words(s.result.text.strip())
 
 
 class Session:
@@ -452,11 +481,54 @@ class SttHandler(BaseHTTPRequestHandler):
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": "sensevoice-small-int8", "object": "model", "owned_by": "dictationd"}]})
+        elif path == "/settings":
+            try:
+                with open(os.path.join(PLUGIN_DIR, "settings.html"), "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+        elif path == "/api/words":
+            self._json(200, {"words": load_custom_words()})
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/v1/audio/transcriptions":
+        path = self.path.rstrip("/")
+        if path == "/api/words":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                item = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            frm, to = str(item.get("from", "")).strip(), str(item.get("to", "")).strip()
+            if not frm or not to:
+                self._json(400, {"error": "from and to are required"})
+                return
+            words = load_custom_words()
+            words = [w for w in words if w["from"].lower() != frm.lower()]
+            words.append({"from": frm, "to": to})
+            save_custom_words(words)
+            self._json(200, {"ok": True, "words": words})
+            return
+        if path == "/api/words/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                item = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            frm = str(item.get("from", "")).strip().lower()
+            words = [w for w in load_custom_words() if w["from"].lower() != frm]
+            save_custom_words(words)
+            self._json(200, {"ok": True, "words": words})
+            return
+        if path != "/v1/audio/transcriptions":
             self._json(404, {"error": "not found"})
             return
         try:
@@ -474,7 +546,7 @@ class SttHandler(BaseHTTPRequestHandler):
                 stream = rec.create_stream()
                 stream.accept_waveform(SAMPLE_RATE, pcm.tolist())
                 rec.decode_stream(stream)
-                text = stream.result.text.strip()
+                text = apply_custom_words(stream.result.text.strip())
             self._json(200, {"text": text})
         except Exception as e:
             log("http error:", e)
