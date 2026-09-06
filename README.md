@@ -72,3 +72,9 @@ rm -rf ~/.local/share/dictationd   # venv + models
 ## License
 
 MIT
+
+## Roadmap
+
+- Settings UI as a proper Omarchy panel plugin (bar icon + popup, integrated with the Omarchy menu system) — the daemon's HTTP API (`/api/words`, `/settings`) is already the backend for it.
+- Custom-word tuning over time: the replacements live in `~/.config/dictationd/custom-words.json` — trivially editable by hand, script, or an AI agent session.
+- Optional: model-level hotword biasing via a transducer engine (Parakeet/hotwords-file), if a compatible runtime lands.
