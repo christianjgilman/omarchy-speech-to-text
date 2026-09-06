@@ -501,34 +501,13 @@ def _finalize(s, auto_enter):
         s.windows.append(s.queue.popleft())
     s.mic.stop()
     log(f"session stop: {s.mode}")
-    text = decode_windows(s.windows, source=f"{s.mode}-tail")
+    text = decode_windows(s.windows)
     if text:
         s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
     if s.pending_text:
         paste_text(s.pending_text)
     if auto_enter:
         wtype("-k", "Return")
-
-
-def flushenter_live():
-    """LIVE mode: decode + paste everything pending + press Enter, keep
-    recording so the next phrase starts with zero latency."""
-    with state_lock:
-        s = session
-        if s is None or s.mode != LIVE:
-            return "not-live"
-        windows = s.windows
-        s.windows = []
-        s.silence_run = 0
-
-    def _flush():
-        text = decode_windows(windows, source="live-flushenter")
-        if text:
-            paste_text(text + " ")
-        wtype("-k", "Return")
-
-    threading.Thread(target=_flush, daemon=True).start()
-    return "flushing"
 
 
 def flush_segment():
@@ -546,7 +525,7 @@ def flush_segment():
     s.silence_run = 0
 
     def _flush():
-        text = decode_windows(windows, source=f"{s.mode}-flush")
+        text = decode_windows(windows)
         if text:
             s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
             paste_text(s.pending_text + " ")
