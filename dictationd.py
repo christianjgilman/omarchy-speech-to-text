@@ -314,24 +314,32 @@ def start_session(mode):
 
 
 def stop_session(auto_enter=False):
-    """Finalize gracefully: drain the capture tail, decode everything pending,
-    type it, close mic. Enter only when auto_enter (Ctrl+Tab send stop)."""
+    """Reply immediately; drain the tail + decode + paste in the background so
+    the compositor (which dispatched the keypress) never blocks on a decode."""
     global session
     with state_lock:
         s = session
         if s is None:
             return "idle"
-    # drain: keep the session alive so the worker ingests the tail audio
-    deadline = time.monotonic() + 0.45
-    while time.monotonic() < deadline:
-        if not s.queue and s.silence_run >= END_SILENCE_WINDOWS:
-            break
-        time.sleep(0.02)
-    with state_lock:
         session = None
+    threading.Thread(target=_finalize, args=(s, auto_enter), daemon=True).start()
+    return f"stopping:{s.mode}"
+
+
+def _finalize(s, auto_enter):
+    """Background finalize: capture the tail, decode the open segment, paste."""
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        if s.queue:
+            time.sleep(0.02)
+        else:
+            time.sleep(0.05)
+            if not s.queue:
+                break
+    while s.queue:
+        s.windows.append(s.queue.popleft())
     s.mic.stop()
     log(f"session stop: {s.mode}")
-    # decode whatever segment is still open, banked into pending
     text = decode_windows(s.windows)
     if text:
         s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
@@ -339,7 +347,6 @@ def stop_session(auto_enter=False):
         paste_text(s.pending_text)
     if auto_enter:
         wtype("-k", "Return")
-    return f"stopped:{s.mode}"
 
 
 def flush_segment():
@@ -352,13 +359,19 @@ def flush_segment():
         open_windows = len(s.windows)
         banked = len(s.pending_text)
     log(f"flush: open_windows={open_windows} banked_chars={banked}")
-    emit_segment(s)  # close the open segment into pending
-    if s.pending_text:
-        paste_text(s.pending_text + " ")
-        s.pending_text = ""
-        return "flushed"
-    log("flush: nothing buffered")
-    return "empty"
+    windows = s.windows
+    s.windows = []
+    s.silence_run = 0
+
+    def _flush():
+        text = decode_windows(windows)
+        if text:
+            s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
+            paste_text(s.pending_text + " ")
+            s.pending_text = ""
+
+    threading.Thread(target=_flush, daemon=True).start()
+    return "flushing"
 
 
 def handle(cmd):
