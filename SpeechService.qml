@@ -18,12 +18,14 @@ Item {
         return (Quickshell.env("XDG_RUNTIME_DIR") || "/run/user/1000") + "/dictationd.sock"
     }
 
-    // Probe: is a dictationd socket already live (externally managed)?
+    // Probe: is a dictationd daemon actually answering? (A stale socket file
+    // from an unclean kill passes `test -S`, so ask the daemon itself.)
     Process {
         id: probe
         command: ["bash", "-c",
-                  "test -S \"" + root.socketPath() + "\" && echo external || echo free"]
+                  "command -v dictationctl >/dev/null 2>&1 && dictationctl status 2>/dev/null || echo free"]
         stdout: StdioCollector {
+            waitForEnd: true
             onStreamFinished: {
                 if (text.trim() === "free") {
                     root.daemonManaged = true

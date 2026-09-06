@@ -19,6 +19,7 @@ import collections
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -513,8 +514,18 @@ def selftest(wav_path):
     print("text:", s.result.text.strip())
 
 
+def _cleanup(*_):
+    try:
+        os.unlink(SOCK_PATH)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 if __name__ == "__main__":
     prctl_name("dictationd")
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
     if len(sys.argv) > 2 and sys.argv[1] == "selftest":
         selftest(sys.argv[2])
         sys.exit(0)
