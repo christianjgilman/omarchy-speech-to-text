@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dictation — custom words</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; justify-content: center;
+    background: #0d1117; color: #e6edf3;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .card {
+    width: min(640px, 94vw); margin: 48px 0; padding: 28px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 14px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 22px; color: #8b949e; font-size: 13.5px; line-height: 1.5; }
+  .row {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 10px;
+  }
+  input {
+    flex: 1; padding: 10px 12px; border-radius: 8px; font-size: 14px;
+    background: #0d1117; color: #e6edf3; border: 1px solid #30363d; outline: none;
+  }
+  input:focus { border-color: #58a6ff; }
+  input::placeholder { color: #6e7681; }
+  .arrow { color: #8b949e; font-size: 18px; }
+  button {
+    padding: 10px 16px; border-radius: 8px; border: 1px solid #30363d;
+    background: #21262d; color: #e6edf3; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #30363d; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; font-weight: 600; }
+  button.primary:hover { background: #388bfd; }
+  .words { margin-top: 22px; display: flex; flex-direction: column; gap: 8px; }
+  .word {
+    display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 10px;
+  }
+  .word .heard { color: #8b949e; text-decoration: line-through; }
+  .word .to { font-weight: 600; }
+  .word .spacer { flex: 1; }
+  .word button {
+    padding: 4px 10px; border-radius: 6px; font-size: 12px;
+    background: transparent; border-color: #30363d; color: #8b949e;
+  }
+  .word button:hover { color: #f85149; border-color: #f85149; }
+  .empty { color: #6e7681; font-size: 14px; text-align: center; padding: 24px 0; }
+  .flash { color: #3fb950; font-size: 13px; height: 18px; margin: 6px 0 0; }
+  kbd {
+    background: #21262d; border: 1px solid #30363d; border-radius: 4px;
+    padding: 1px 6px; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Dictation — custom words</h1>
+  <p class="sub">
+    Teach the transcriber words it keeps getting wrong: what it typically
+    <em>hears</em>, and what you actually said. Applied instantly to every
+    transcription, in all modes. Changes take effect on the next dictation —
+    no restart needed.
+  </p>
+  <div class="row">
+    <input id="heard" placeholder="It hears… (e.g. cymba)" autocomplete="off">
+    <span class="arrow">→</span>
+    <input id="to" placeholder="Write… (e.g. Zimba)" autocomplete="off">
+    <button class="primary" id="add">Add</button>
+  </div>
+  <div class="flash" id="flash"></div>
+  <div class="words" id="words"></div>
+  <p class="sub" style="margin-top:22px">
+    Stored in <kbd>~/.config/dictationd/custom-words.json</kbd> — edits apply
+    on the next utterance. You can also say a filler word and keep it; the
+    recognizer hears what it hears, this list corrects it.
+  </p>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function refresh() {
+  const res = await fetch('/api/words');
+  const data = (await res.json()).words || [];
+  const box = $('words');
+  box.innerHTML = data.length ? '' : '<div class="empty">No custom words yet — add the first one above.</div>';
+  for (const w of data) {
+    const row = document.createElement('div');
+    row.className = 'word';
+    row.innerHTML = `<span class="heard">${esc(w.from)}</span><span>→</span>` +
+                    `<span class="to">${esc(w.to)}</span><span class="spacer"></span>`;
+    const del = document.createElement('button');
+    del.textContent = 'Remove';
+    del.onclick = async () => {
+      await fetch('/api/words/delete', { method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ from: w.from }) });
+      refresh();
+    };
+    row.appendChild(del);
+    box.appendChild(row);
+  }
+}
+
+$('add').onclick = async () => {
+  const from = $('heard').value.trim(), to = $('to').value.trim();
+  if (!from || !to) { flash('Fill both fields.'); return; }
+  await fetch('/api/words', { method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ from, to }) });
+  $('heard').value = ''; $('to').value = '';
+  flash('Added — applies from your next dictation.');
+  refresh();
+};
+
+function flash(msg) { $('flash').textContent = msg; setTimeout(() => $('flash').textContent = '', 2500); }
+
+refresh();
+</script>
+</body>
+</html>
