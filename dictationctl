@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""dictationctl — control client for dictationd.
+Commands: send (ctrl+tab toggle), caps (ctrl+caps: live toggle / flush), status, stop"""
+import socket, sys, os
+
+sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "dictationd.sock")
+cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+try:
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(10)
+    c.connect(sock)
+    c.sendall(cmd.encode())
+    print(c.recv(256).decode())
+except (FileNotFoundError, ConnectionRefusedError):
+    print("dictationd not running", file=sys.stderr)
+    sys.exit(1)

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "champion.speech-to-text",
+  "name": "Speech to Text",
+  "version": "1.0.0",
+  "author": "champion",
+  "license": "MIT",
+  "description": "Local real-time speech-to-text: streaming dictation daemon (SenseVoice, OpenAI-compatible STT endpoint on 127.0.0.1:8765) + the dictation pill overlay. Ctrl+Tab = send mode, Ctrl+grave = live mode.",
+  "kinds": [
+    "overlay",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "DictationPill.qml",
+    "service": "SpeechService.qml"
+  }
+}
