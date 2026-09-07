@@ -16,9 +16,11 @@ dictation-pill plugin can gate on it.
 
 import ctypes
 import collections
+import difflib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -33,11 +35,16 @@ import sherpa_onnx
 MODEL_DIR = os.path.expanduser("~/.local/share/dictationd/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
 VAD_MODEL = os.path.expanduser("~/.local/share/dictationd/models/silero_vad.onnx")
 SAMPLE_RATE = 16000
-VAD_THRESHOLD = 0.42         # silero speech probability gate (lower = hears soft fillers)
+VAD_THRESHOLD = 0.50         # silero speech probability gate (lower = hears soft fillers, higher = ignores music; ghost single-words are caught by the one-word filter)
 MIN_SPEECH_MS = 120           # discard blips shorter than this (kept low: soft fillers)
 PRE_BUFFER_S = 0.40           # audio kept before speech starts (word onsets)
-SEGMENT_END_SILENCE_S = 0.7   # silence that closes a segment (triggers decode)
-MAX_SEGMENT_S = 10.0          # force a segment break on very long continuous speech
+SEGMENT_END_SILENCE_S = 1.0   # silence that closes a segment (triggers decode; high enough to ride over mid-phrase pauses)
+SPLIT_SOFT_S = 10.0           # start hunting for a word gap to split long speech
+SPLIT_HARD_S = 14.0           # cut by now even mid-word, at the quietest recent window
+SPLIT_DIP_WINDOWS = 2         # consecutive quiet windows that count as a word gap (~64ms)
+SPLIT_LOOKBACK_S = 1.5        # window searched for the quietest cut point on hard split
+FUZZY_WORD_RATIO = 0.72       # vocab entries: near-miss transcript words corrected to the target
+ONE_WORD_WHITELIST = {"launch", "go", "approved", "bro", "it's", "i'm", "don't", "can't", "won't", "you're", "we're", "they're", "isn't", "doesn't", "didn't", "c", "ci"}  # single-word segments kept only if in this set (lowercase)
 HTTP_HOST = "127.0.0.1"       # OpenAI-compatible STT endpoint (local only)
 HTTP_PORT = 8765
 LIVE = "live"
@@ -47,6 +54,8 @@ decode_lock = threading.Lock()  # SenseVoice decode is not thread-safe
 
 SOCK_PATH = os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "dictationd.sock")
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+CUSTOM_WORDS_PATH = os.path.expanduser("~/.config/dictationd/custom-words.json")
 
 
 def log(*a):
@@ -71,6 +80,20 @@ def wtype(*args):
 def type_text(text):
     if text:
         wtype(text)
+
+
+paste_lock = threading.Lock()  # copy+paste must be atomic vs clipboard restore
+
+
+def paste_now(text):
+    """wl-copy + paste keystroke as one atomic unit (paste_lock held)."""
+    subprocess.run(["wl-copy", text], check=True)
+    cls = focused_window_class()
+    if cls in TERMINAL_CLASSES:
+        wtype("-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl")
+    else:
+        wtype("-M", "ctrl", "-k", "v", "-m", "ctrl")
+    return cls
 
 
 def start_delta(text):
@@ -108,11 +131,8 @@ def paste_text(text, enter=False):
                                   text=True, timeout=2).stdout
         except Exception:
             pass
-        subprocess.run(["wl-copy", text], check=True)
-        if cls in TERMINAL_CLASSES:
-            wtype("-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl")
-        else:
-            wtype("-M", "ctrl", "-k", "v", "-m", "ctrl")
+        with paste_lock:
+            cls = paste_now(text)
         log(f"paste: {len(text)} chars -> focused='{cls}' enter={enter}")
         if prev is not None:
             def restore():
@@ -148,11 +168,113 @@ vad_cfg.provider = "cpu"
 vad = sherpa_onnx.VadModel.create(vad_cfg)
 vad_window = vad.window_size()  # samples silero expects per is_speech call
 END_SILENCE_WINDOWS = int(SEGMENT_END_SILENCE_S * SAMPLE_RATE / vad_window)
-MAX_SEGMENT_WINDOWS = int(MAX_SEGMENT_S * SAMPLE_RATE / vad_window)
+SPLIT_SOFT_WINDOWS = int(SPLIT_SOFT_S * SAMPLE_RATE / vad_window)
+SPLIT_HARD_WINDOWS = int(SPLIT_HARD_S * SAMPLE_RATE / vad_window)
+SPLIT_LOOKBACK_WINDOWS = int(SPLIT_LOOKBACK_S * SAMPLE_RATE / vad_window)
+SENTENCE_ENDS = ".!?\u2026" 
 log("models ready")
 
 
-def decode_windows(windows):
+def load_custom_words():
+    """Return the replacements list ([{from,to}, ...]); missing file = empty."""
+    try:
+        with open(CUSTOM_WORDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        words = data.get("replacements", [])
+        return [w for w in words if w.get("to")]
+    except Exception:
+        return []
+
+
+def save_custom_words(words):
+    os.makedirs(os.path.dirname(CUSTOM_WORDS_PATH), exist_ok=True)
+    with open(CUSTOM_WORDS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"replacements": words}, f, ensure_ascii=False, indent=1)
+
+
+def apply_one_word_filter(text):
+    """Drop one-word segments unless whitelisted (music/ghost artifacts
+    surface as lone words; real commands are whitelisted)."""
+    if text and len(text.split()) == 1 and text.lower().strip(".,!?;:") not in ONE_WORD_WHITELIST:
+        log("dropped one-word segment:", text)
+        return ""
+    return text
+
+
+def apply_custom_words(text):
+    """Two layers:
+    1. exact replacements (heard -> write), case-insensitive, longest first;
+    2. vocabulary entries (write-only): near-miss transcript words/phrases
+       fuzzy-matched to the target, so you can add names without knowing what
+       the recognizer mangles them into."""
+    text = apply_one_word_filter(text)
+    words = load_custom_words()
+    if not text or not words:
+        return text
+    for w in sorted([w for w in words if w.get("from")],
+                    key=lambda w: len(w["from"]), reverse=True):
+        # whole-word only: a short "from" ("c") must never fire inside a
+        # real word ("appreciate")
+        pattern = r"(?<!\w)" + re.escape(w["from"]) + r"(?!\w)"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            log("custom-word:", w["from"], "->", w["to"])
+        text = re.sub(pattern, w["to"], text, flags=re.IGNORECASE)
+
+    vocab = [w["to"].strip() for w in words if not w.get("from") and len(w["to"].strip()) >= 4]
+    if not vocab:
+        return text
+    tokens = text.split(" ")
+    for target in vocab:
+        t_lower = target.lower()
+        t_compact = t_lower.replace(" ", "")
+        t_tokens = t_lower.split(" ")
+        n = len(t_tokens)
+        i = 0
+        while i < len(tokens):
+            core = tokens[i].strip('.,!?;:"').lower()
+            if n == 1:
+                # two-token window first ("moto gp"), then single token
+                # ("valen"); single-token first would eat half of the
+                # bigram ("MotoGP gp") and leave a stray token behind.
+                hit = False
+                span = 1
+                if i + 1 < len(tokens):
+                    nxt = tokens[i + 1].strip('.,!?;:"').lower()
+                    bigram = core + nxt
+                    if (bigram == t_compact or (t_lower not in bigram and len(bigram) >= 6)) and difflib.SequenceMatcher(None, bigram, t_compact).ratio() >= FUZZY_WORD_RATIO:
+                        hit = True
+                        span = 2
+                if not hit:
+                    hit = len(core) >= 4 and difflib.SequenceMatcher(None, core, t_lower).ratio() >= FUZZY_WORD_RATIO
+                    span = 1
+            else:
+                window = tokens[i:i + n]
+                if len(window) < n:
+                    i += 1
+                    continue
+                cand = "".join(x.strip('.,!?;:"').lower() for x in window)
+                hit = len(cand) >= 6 and difflib.SequenceMatcher(None, cand, t_compact).ratio() >= FUZZY_WORD_RATIO
+                span = n
+            if hit:
+                log("vocab:", " ".join(tokens[i:i + span]), "->", target)
+                tokens[i:i + span] = [target]
+                i += span
+                continue
+            i += 1
+    return " ".join(tokens)
+    return " ".join(tokens)
+
+
+def log_transcript(text, source):
+    """Append every decoded phrase to one JSONL log for later analysis."""
+    import datetime, json
+    entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+             "source": source, "text": text}
+    with open(os.path.expanduser("~/.local/share/dictationd/transcripts.jsonl"), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def decode_windows(windows, source="dictation"):
     """Offline-decode concatenated float32 windows; returns styled text."""
     if not windows:
         return ""
@@ -163,13 +285,21 @@ def decode_windows(windows):
         s = rec.create_stream()
         s.accept_waveform(SAMPLE_RATE, audio.tolist())
         rec.decode_stream(s)
-        return s.result.text.strip()
+        text = apply_custom_words(s.result.text.strip())
+    if text:
+        try:
+            log_transcript(text, source)
+        except OSError as e:
+            log("transcript log write failed:", e)
+    return text
 
 
 class Session:
     def __init__(self, mode):
         self.mode = mode              # SEND | LIVE
         self.windows = []             # speech windows of the open segment
+        self.win_energy = []          # per-window RMS, parallel to windows
+        self.tail = ""                # last char of the last pasted segment (for casing)
         self.pending_text = ""        # decoded text not yet typed (send mode)
         self.pending_has_text = False
         self.speech_windows = 0       # decaying speech counter for the gate
@@ -232,20 +362,41 @@ class MicStream:
                 pass
 
 
-def emit_segment(s, force=False):
-    """Close the open segment: decode its audio. LIVE types immediately;
-    SEND banks the text into pending_text (typed on flush/stop)."""
-    text = decode_windows(s.windows)
-    s.windows = []
-    s.silence_run = 0
+def deliver(s, text, source):
+    """Case a decoded segment against what was said before it, then deliver:
+    LIVE pastes immediately; SEND banks into pending_text."""
     if not text:
         return
+    if s.tail and s.tail[-1] not in SENTENCE_ENDS:
+        text = text[:1].lower() + text[1:]
+    s.tail = text.rstrip()[-1:] or s.tail
     if s.mode == LIVE:
-        type_text(text + " ")
+        paste_text(text + " ")
     elif s.pending_text:
         s.pending_text += " " + text
     else:
         s.pending_text = text
+
+
+def emit_segment(s, force=False):
+    """Close the open segment: decode its audio and clear it."""
+    text = decode_windows(s.windows, source=s.mode)
+    s.windows = []
+    s.win_energy = []
+    s.silence_run = 0
+    deliver(s, text, s.mode)
+
+
+def split_segment(s, cut):
+    """Best-cut a long segment at a word boundary: decode the head, keep the
+    tail (and its energies) as the start of the next segment. Speech continues
+    without the gate re-arming, so the flow never stutters."""
+    head, tail = s.windows[:cut], s.windows[cut:]
+    ehead, etail = s.win_energy[:cut], s.win_energy[cut:]
+    s.windows, s.win_energy = tail, etail
+    s.silence_run = 0
+    text = decode_windows(head, source=f"{s.mode}-split")
+    deliver(s, text, s.mode)
 
 
 def worker():
@@ -285,17 +436,28 @@ def worker():
 
         # inside a speech segment
         s.windows.append(win)
+        s.win_energy.append(float(np.sqrt(np.mean(win * win))))
+        total = sum(len(w) for w in s.windows)
         if not is_speech:
+            if s.silence_run == 0:
+                s.dip_start = len(s.windows) - 1
             s.silence_run += 1
             if s.silence_run >= END_SILENCE_WINDOWS:
                 emit_segment(s)
                 s.speech_seen = False
                 s.prebuf.clear()
                 s.prebuf.append(win)  # keep trailing silence as new pre-buffer
+            elif s.silence_run >= SPLIT_DIP_WINDOWS and total >= SPLIT_SOFT_WINDOWS * vad_window:
+                # natural word gap in long speech: cut at the dip start
+                split_segment(s, s.dip_start)
         else:
             s.silence_run = 0
-            if sum(len(w) for w in s.windows) >= MAX_SEGMENT_WINDOWS * vad_window:
-                emit_segment(s)
+            if total >= SPLIT_HARD_WINDOWS * vad_window:
+                # truly continuous speech, no gap found: cut at the quietest
+                # window of the recent tail (least-bad word boundary)
+                look = min(SPLIT_LOOKBACK_WINDOWS, len(s.win_energy) - 1)
+                cut = len(s.win_energy) - look + int(np.argmin(s.win_energy[-look:]))
+                split_segment(s, cut)
                 s.speech_seen = True  # still talking; keep segment open
 
 
@@ -313,32 +475,60 @@ def start_session(mode):
 
 
 def stop_session(auto_enter=False):
-    """Finalize gracefully: drain the capture tail, decode everything pending,
-    type it, close mic. Enter only when auto_enter (Ctrl+Tab send stop)."""
+    """Reply immediately; drain the tail + decode + paste in the background so
+    the compositor (which dispatched the keypress) never blocks on a decode."""
     global session
     with state_lock:
         s = session
         if s is None:
             return "idle"
-    # drain: keep the session alive so the worker ingests the tail audio
-    deadline = time.monotonic() + 0.45
-    while time.monotonic() < deadline:
-        if not s.queue and s.silence_run >= END_SILENCE_WINDOWS:
-            break
-        time.sleep(0.02)
-    with state_lock:
         session = None
+    threading.Thread(target=_finalize, args=(s, auto_enter), daemon=True).start()
+    return f"stopping:{s.mode}"
+
+
+def _finalize(s, auto_enter):
+    """Background finalize: capture the tail, decode the open segment, paste."""
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        if s.queue:
+            time.sleep(0.02)
+        else:
+            time.sleep(0.05)
+            if not s.queue:
+                break
+    while s.queue:
+        s.windows.append(s.queue.popleft())
     s.mic.stop()
     log(f"session stop: {s.mode}")
-    # decode whatever segment is still open, banked into pending
-    text = decode_windows(s.windows)
+    text = decode_windows(s.windows, source=f"{s.mode}-tail")
     if text:
         s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
     if s.pending_text:
         paste_text(s.pending_text)
     if auto_enter:
         wtype("-k", "Return")
-    return f"stopped:{s.mode}"
+
+
+def flushenter_live():
+    """LIVE mode: decode + paste everything pending + press Enter, keep
+    recording so the next phrase starts with zero latency."""
+    with state_lock:
+        s = session
+        if s is None or s.mode != LIVE:
+            return "not-live"
+        windows = s.windows
+        s.windows = []
+        s.silence_run = 0
+
+    def _flush():
+        text = decode_windows(windows, source="live-flushenter")
+        if text:
+            paste_text(text + " ")
+        wtype("-k", "Return")
+
+    threading.Thread(target=_flush, daemon=True).start()
+    return "flushing"
 
 
 def flush_segment():
@@ -351,13 +541,19 @@ def flush_segment():
         open_windows = len(s.windows)
         banked = len(s.pending_text)
     log(f"flush: open_windows={open_windows} banked_chars={banked}")
-    emit_segment(s)  # close the open segment into pending
-    if s.pending_text:
-        paste_text(s.pending_text + " ")
-        s.pending_text = ""
-        return "flushed"
-    log("flush: nothing buffered")
-    return "empty"
+    windows = s.windows
+    s.windows = []
+    s.silence_run = 0
+
+    def _flush():
+        text = decode_windows(windows, source=f"{s.mode}-flush")
+        if text:
+            s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
+            paste_text(s.pending_text + " ")
+            s.pending_text = ""
+
+    threading.Thread(target=_flush, daemon=True).start()
+    return "flushing"
 
 
 def handle(cmd):
@@ -377,6 +573,8 @@ def handle(cmd):
         if cur == LIVE:
             return stop_session(auto_enter=False)
         return start_session(LIVE)
+    if cmd == "flushenter":
+        return flushenter_live()
     if cmd == "status":
         with state_lock:
             cur = session.mode if session else None
@@ -438,11 +636,57 @@ class SttHandler(BaseHTTPRequestHandler):
         elif path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": "sensevoice-small-int8", "object": "model", "owned_by": "dictationd"}]})
+        elif path == "/settings":
+            try:
+                with open(os.path.join(PLUGIN_DIR, "settings.html"), "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+        elif path == "/api/words":
+            self._json(200, {"words": load_custom_words()})
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/v1/audio/transcriptions":
+        path = self.path.rstrip("/")
+        if path == "/api/words":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                item = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            frm, to = str(item.get("from", "")).strip(), str(item.get("to", "")).strip()
+            if not to or (frm and frm.lower() == to.lower()):
+                self._json(400, {"error": "to is required (from optional)"})
+                return
+            words = load_custom_words()
+            if frm:
+                words = [w for w in words if (w.get("from") or "").lower() != frm.lower()]
+            else:
+                words = [w for w in words if w.get("to") != to]
+            words.append({"from": frm, "to": to})
+            save_custom_words(words)
+            self._json(200, {"ok": True, "words": words})
+            return
+        if path == "/api/words/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                item = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                self._json(400, {"error": "bad json"})
+                return
+            frm = str(item.get("from", "")).strip().lower()
+            words = [w for w in load_custom_words() if (w.get("from") or "").lower() != frm]
+            save_custom_words(words)
+            self._json(200, {"ok": True, "words": words})
+            return
+        if path != "/v1/audio/transcriptions":
             self._json(404, {"error": "not found"})
             return
         try:
@@ -460,7 +704,12 @@ class SttHandler(BaseHTTPRequestHandler):
                 stream = rec.create_stream()
                 stream.accept_waveform(SAMPLE_RATE, pcm.tolist())
                 rec.decode_stream(stream)
-                text = stream.result.text.strip()
+                text = apply_custom_words(stream.result.text.strip())
+            if text:
+                try:
+                    log_transcript(text, "api")
+                except OSError as e:
+                    log("transcript log write failed:", e)
             self._json(200, {"text": text})
         except Exception as e:
             log("http error:", e)
@@ -513,8 +762,18 @@ def selftest(wav_path):
     print("text:", s.result.text.strip())
 
 
+def _cleanup(*_):
+    try:
+        os.unlink(SOCK_PATH)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 if __name__ == "__main__":
     prctl_name("dictationd")
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
     if len(sys.argv) > 2 and sys.argv[1] == "selftest":
         selftest(sys.argv[2])
         sys.exit(0)

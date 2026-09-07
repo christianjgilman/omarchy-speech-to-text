@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""dictation-enter — Enter key dispatcher for live dictation.
+
+In LIVE mode: flush the pending segment, paste it, press Enter, keep recording.
+Any other time: forward a normal Enter keystroke.
+"""
+import socket, subprocess, sys, os
+
+sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), "dictationd.sock")
+
+
+def daemon_cmd(cmd):
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(1)
+        c.connect(sock)
+        c.sendall(cmd.encode())
+        r = c.recv(256).decode().strip()
+        c.close()
+        return r
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+        return None
+
+
+def press_enter():
+    for tool in (["wtype", "-k", "Return"], ["ydotool", "key", "28:1", "28:0"]):
+        try:
+            # Hard timeout: wtype needs the compositor to answer Wayland
+            # requests; if the caller ever blocks the compositor waiting on
+            # us, an un-timeouted wtype would deadlock the session.
+            subprocess.run(tool, check=True, capture_output=True, timeout=2)
+            return
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired):
+            continue
+
+
+state = daemon_cmd("status")
+if state == "live":
+    # flush+send; the daemon pastes text and presses Enter itself
+    r = daemon_cmd("flushenter")
+    if r != "flushing":
+        press_enter()
+else:
+    press_enter()
