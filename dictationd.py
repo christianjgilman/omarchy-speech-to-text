@@ -866,6 +866,11 @@ def serve():
             try:
                 data = conn.recv(256).decode().strip()
                 if data:
+                    import struct
+                    pid = struct.unpack("3i", conn.getsockopt(
+                        socket.SOL_SOCKET, 17, 12))[0]  # SO_PEERCRED
+                    if data != "status":
+                        log("cmd:", data, "from pid", pid)
                     conn.sendall(handle(data).encode())
             except Exception as e:
                 log("conn error:", e)
