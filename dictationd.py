@@ -86,13 +86,16 @@ paste_lock = threading.Lock()  # copy+paste must be atomic vs clipboard restore
 
 
 def paste_now(text):
-    """wl-copy + paste keystroke as one atomic unit (paste_lock held)."""
+    """wl-copy + paste keystroke as one atomic unit (paste_lock held).
+    Paste key is Shift+Insert: this machine's keymap turns an injected
+    Ctrl+V into Ctrl+Escape, which fired the discard bind after every
+    paste and killed live sessions (verified 2026-09-07 22:24)."""
     subprocess.run(["wl-copy", text], check=True)
     cls = focused_window_class()
     if cls in TERMINAL_CLASSES:
         wtype("-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl")
     else:
-        wtype("-M", "ctrl", "-k", "v", "-m", "ctrl")
+        wtype("-M", "shift", "-k", "Insert", "-m", "shift")
     return cls
 
 
