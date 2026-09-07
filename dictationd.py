@@ -16,6 +16,7 @@ dictation-pill plugin can gate on it.
 
 import ctypes
 import collections
+import difflib
 import json
 import os
 import re
@@ -39,6 +40,7 @@ MIN_SPEECH_MS = 120           # discard blips shorter than this (kept low: soft 
 PRE_BUFFER_S = 0.40           # audio kept before speech starts (word onsets)
 SEGMENT_END_SILENCE_S = 0.7   # silence that closes a segment (triggers decode)
 MAX_SEGMENT_S = 10.0          # force a segment break on very long continuous speech
+FUZZY_WORD_RATIO = 0.72       # vocab entries: near-miss transcript words corrected to the target
 HTTP_HOST = "127.0.0.1"       # OpenAI-compatible STT endpoint (local only)
 HTTP_PORT = 8765
 LIVE = "live"
@@ -161,7 +163,7 @@ def load_custom_words():
         with open(CUSTOM_WORDS_PATH, encoding="utf-8") as f:
             data = json.load(f)
         words = data.get("replacements", [])
-        return [w for w in words if w.get("from") and w.get("to")]
+        return [w for w in words if w.get("to")]
     except Exception:
         return []
 
@@ -173,13 +175,55 @@ def save_custom_words(words):
 
 
 def apply_custom_words(text):
+    """Two layers:
+    1. exact replacements (heard -> write), case-insensitive, longest first;
+    2. vocabulary entries (write-only): near-miss transcript words/phrases
+       fuzzy-matched to the target, so you can add names without knowing what
+       the recognizer mangles them into."""
     words = load_custom_words()
     if not text or not words:
         return text
-    # longest match first so longer phrases win over their prefixes
-    for w in sorted(words, key=lambda w: len(w["from"]), reverse=True):
+    for w in sorted([w for w in words if w.get("from")],
+                    key=lambda w: len(w["from"]), reverse=True):
         text = re.sub(re.escape(w["from"]), w["to"], text, flags=re.IGNORECASE)
-    return text
+
+    vocab = [w["to"].strip() for w in words if not w.get("from") and len(w["to"].strip()) >= 4]
+    if not vocab:
+        return text
+    tokens = text.split(" ")
+    for target in vocab:
+        t_lower = target.lower()
+        t_compact = t_lower.replace(" ", "")
+        t_tokens = t_lower.split(" ")
+        n = len(t_tokens)
+        i = 0
+        while i < len(tokens):
+            core = tokens[i].strip('.,!?;:"').lower()
+            if n == 1:
+                # single-token match, plus a two-token window: the recognizer
+                # often splits one spoken word into pieces ("shao ting")
+                hit = len(core) >= 4 and difflib.SequenceMatcher(None, core, t_lower).ratio() >= FUZZY_WORD_RATIO
+                span = 1
+                if not hit and i + 1 < len(tokens):
+                    nxt = tokens[i + 1].strip('.,!?;:"').lower()
+                    bigram = core + nxt
+                    hit = (t_lower not in bigram) and len(bigram) >= 6 and difflib.SequenceMatcher(None, bigram, t_compact).ratio() >= FUZZY_WORD_RATIO
+                    span = 2
+            else:
+                window = tokens[i:i + n]
+                if len(window) < n:
+                    i += 1
+                    continue
+                cand = "".join(x.strip('.,!?;:"').lower() for x in window)
+                hit = len(cand) >= 6 and difflib.SequenceMatcher(None, cand, t_compact).ratio() >= FUZZY_WORD_RATIO
+                span = n
+            if hit:
+                tokens[i:i + span] = [target]
+                i += span
+                continue
+            i += 1
+    return " ".join(tokens)
+    return " ".join(tokens)
 
 
 def decode_windows(windows):
