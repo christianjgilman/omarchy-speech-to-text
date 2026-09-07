@@ -611,8 +611,10 @@ def flushenter_live():
     return "flushing"
 
 
-def flush_segment():
-    """Send mode: decode + paste the section so far, keep recording."""
+def flush_segment(enter=False):
+    """Send mode: decode + paste the section so far, keep recording.
+    enter=True (spoken grave) also presses Return after pasting, so the
+    message sends while recording continues."""
     with state_lock:
         s = session
         if s is None or s.mode != SEND:
@@ -637,6 +639,10 @@ def flush_segment():
             s.pending_text = ""
         if out:
             paste_text(out + " ")
+            # send only lands when there was something to send; a bare grave
+            # on silence must never fire an empty Enter into the chat
+            if enter:
+                wtype("-k", "Return")
 
     threading.Thread(target=_flush, daemon=True).start()
     return "flushing"
@@ -665,6 +671,8 @@ def handle(cmd):
         with state_lock:
             cur = session.mode if session else None
         return cur or "idle"
+    if cmd == "flushsend":
+        return flush_segment(enter=True)
     if cmd == "stop":
         return stop_session(auto_enter=False)
     return f"unknown:{cmd}"
