@@ -250,7 +250,7 @@ def apply_slash_commands(text):
         if core == SLASH_WORD and i + 1 < len(tokens):
             hit, span = None, 0
             for n in (1, 2, 3):
-                if i + n > len(tokens):
+                if i + 1 + n > len(tokens):
                     break
                 spoken = "".join(tokens[i + 1 + j].strip('.,!?;:"').lower()
                                  for j in range(n))
@@ -487,6 +487,18 @@ def worker():
             log("vad error:", e)
             continue
 
+        # one bad window or a bug in a new feature must NEVER kill the
+        # pipeline: a dead worker black-holes all dictation until restart
+        # (happened 2026-09-07: slash-command IndexError silenced live mode
+        # mid-session, words only surfaced on session stop)
+        try:
+            worker_step(s, win, is_speech)
+        except Exception as e:
+            import traceback
+            log("worker step error:", e)
+            traceback.print_exc()
+
+def worker_step(s, win, is_speech):
         if not s.speech_seen:
             s.prebuf.append(win)
             # decaying counter: word gaps don't reset it, random blips don't fire it
@@ -500,7 +512,7 @@ def worker():
                 for w in list(s.prebuf):
                     s.windows.append(w)
                 s.prebuf.clear()
-            continue
+            return
 
         # inside a speech segment
         s.windows.append(win)
