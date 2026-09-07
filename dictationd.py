@@ -625,7 +625,9 @@ def flushenter_live(enter=True):
         s.silence_run = 0
 
     def _flush():
+        global LAST_FLUSH_TS
         text = decode_windows(windows, source="live-flush")
+        LAST_FLUSH_TS = time.monotonic()
         if text:
             paste_text(text + " ")
         if enter:
@@ -635,9 +637,19 @@ def flushenter_live(enter=True):
     return "flushing"
 
 
+LAST_FLUSH_TS = 0.0            # guard: macro keys chain ctrl+esc after grave
+DISCARD_GUARD_S = 1.5
+
+
 def discard_session():
-    """Graceful bail for ALL modes: stop without decoding/pasting/sending."""
-    global session
+    """Graceful bail for ALL modes: stop without decoding/pasting/sending.
+    Ignores discards that arrive right after a flush — the user's macro key
+    chains ctrl+esc behind grave, and without the guard every flush would
+    also kill the session."""
+    global session, LAST_FLUSH_TS
+    if time.monotonic() - LAST_FLUSH_TS < DISCARD_GUARD_S:
+        log("discard ignored (within guard window after flush)")
+        return "guarded"
     with state_lock:
         s = session
         session = None
