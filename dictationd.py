@@ -38,8 +38,8 @@ SAMPLE_RATE = 16000
 VAD_THRESHOLD = 0.50         # silero speech probability gate (lower = hears soft fillers, higher = ignores music; ghost single-words are caught by the one-word filter)
 MIN_SPEECH_MS = 120           # discard blips shorter than this (kept low: soft fillers)
 PRE_BUFFER_S = 0.40           # audio kept before speech starts (word onsets)
-SEGMENT_END_SILENCE_S = 1.0   # silence that closes a segment (triggers decode; high enough to ride over mid-phrase pauses)
-SPLIT_SOFT_S = 10.0           # start hunting for a word gap to split long speech
+SEGMENT_END_SILENCE_S = 0.85  # silence that closes a segment (latency vs mid-phrase chopping)
+SPLIT_SOFT_S = 6.0            # start hunting for a word gap to split long speech (paste cadence)
 SPLIT_HARD_S = 14.0           # cut by now even mid-word, at the quietest recent window
 SPLIT_DIP_WINDOWS = 2         # consecutive quiet windows that count as a word gap (~64ms)
 SPLIT_LOOKBACK_S = 1.5        # window searched for the quietest cut point on hard split
@@ -83,6 +83,7 @@ def type_text(text):
 
 
 paste_lock = threading.Lock()  # copy+paste must be atomic vs clipboard restore
+flush_lock = threading.Lock()  # flush+enter sequences run in submission order
 
 
 def paste_now(text):
@@ -629,12 +630,13 @@ def flushenter_live(enter=True):
 
     def _flush():
         global LAST_FLUSH_TS
-        text = decode_windows(windows, source="live-flush")
-        LAST_FLUSH_TS = time.monotonic()
-        if text:
-            paste_text(text + " ")
-        if enter:
-            wtype("-k", "Return")
+        with flush_lock:  # order matters: an earlier chunk must paste before a later Enter
+            text = decode_windows(windows, source="live-flush")
+            LAST_FLUSH_TS = time.monotonic()
+            if text:
+                paste_text(text + " ")
+            if enter:
+                wtype("-k", "Return")
 
     threading.Thread(target=_flush, daemon=True).start()
     return "flushing"
