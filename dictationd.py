@@ -202,8 +202,21 @@ def apply_one_word_filter(text):
 
 
 SKILL_DIRS = ("~/.agents/skills", "~/.zcode/skills")
+SKILL_WORDS_PATH = os.path.expanduser("~/.config/dictationd/skills-words.json")
 SLASH_WORD = "slash"
 SLASH_RATIO = 0.8  # fuzzy floor for matching a spoken name to a real skill
+
+
+def load_skill_words():
+    """Skill spoken-aliases: {"<skill name>": ["alias", ...]}. Aliases match
+    ONLY after "slash" (commands stay commands, normal language untouched)."""
+    try:
+        with open(SKILL_WORDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k.lower(): [a.lower() for a in v] for k, v in data.items()
+                if isinstance(v, list)}
+    except Exception:
+        return {}
 
 
 def load_slash_skills():
@@ -244,6 +257,12 @@ def apply_slash_commands(text):
     skills = load_slash_skills()
     if not skills:
         return text
+    # alias -> canonical (aliases match only in the slash position)
+    alias_map = {}
+    for skill, aliases in load_skill_words().items():
+        if skill in skills:
+            for a in aliases:
+                alias_map[a] = skill
     out, i = [], 0
     while i < len(tokens):
         core = tokens[i].strip('.,!?;:"').lower()
@@ -254,6 +273,9 @@ def apply_slash_commands(text):
                     break
                 spoken = "".join(tokens[i + 1 + j].strip('.,!?;:"').lower()
                                  for j in range(n))
+                if spoken in alias_map:
+                    hit, span = alias_map[spoken], n
+                    break
                 m = match_skill(spoken, skills)
                 if m:
                     hit, span = m, n
@@ -590,8 +612,8 @@ def _finalize(s, auto_enter):
         wtype("-k", "Return")
 
 
-def flushenter_live():
-    """LIVE mode: decode + paste everything pending + press Enter, keep
+def flushenter_live(enter=True):
+    """LIVE mode: decode + paste everything pending (+ Enter if send), keep
     recording so the next phrase starts with zero latency."""
     with state_lock:
         s = session
@@ -599,16 +621,34 @@ def flushenter_live():
             return "not-live"
         windows = s.windows
         s.windows = []
+        s.win_energy = []
         s.silence_run = 0
 
     def _flush():
-        text = decode_windows(windows, source="live-flushenter")
+        text = decode_windows(windows, source="live-flush")
         if text:
             paste_text(text + " ")
-        wtype("-k", "Return")
+        if enter:
+            wtype("-k", "Return")
 
     threading.Thread(target=_flush, daemon=True).start()
     return "flushing"
+
+
+def discard_session():
+    """Graceful bail for ALL modes: stop without decoding/pasting/sending."""
+    global session
+    with state_lock:
+        s = session
+        session = None
+    if s is None:
+        return "idle"
+    try:
+        s.mic.stop()
+    except Exception:
+        pass
+    log(f"session discarded: {s.mode} ({len(s.windows)} windows dropped)")
+    return "discarded"
 
 
 def flush_segment():
@@ -651,8 +691,12 @@ def handle(cmd):
         if cur == SEND:
             return flush_segment()
         if cur == LIVE:
-            return stop_session(auto_enter=False)
+            return flushenter_live(enter=True)  # flush + send + keep live
         return start_session(LIVE)
+    if cmd == "flushlive":
+        return flushenter_live(enter=False)  # flush + paste, no send
+    if cmd == "discard":
+        return discard_session()
     if cmd == "flushenter":
         return flushenter_live()
     if cmd == "status":
