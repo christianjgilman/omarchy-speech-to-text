@@ -626,11 +626,17 @@ def flush_segment():
     s.silence_run = 0
 
     def _flush():
-        text = decode_windows(windows, source=f"{s.mode}-flush")
-        if text:
-            s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
-            paste_text(s.pending_text + " ")
+        text = decode_windows(windows, source=f"{s.mode}-flush") if windows else ""
+        with state_lock:
+            if text:
+                s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
+            # paste whatever is banked, even when the open segment was empty:
+            # a pause between sentences banks the phrase and empties the
+            # segment, and the flush must still render it immediately
+            out = s.pending_text
             s.pending_text = ""
+        if out:
+            paste_text(out + " ")
 
     threading.Thread(target=_flush, daemon=True).start()
     return "flushing"
