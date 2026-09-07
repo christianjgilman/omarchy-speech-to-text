@@ -38,8 +38,8 @@ SAMPLE_RATE = 16000
 VAD_THRESHOLD = 0.50         # silero speech probability gate (lower = hears soft fillers, higher = ignores music; ghost single-words are caught by the one-word filter)
 MIN_SPEECH_MS = 120           # discard blips shorter than this (kept low: soft fillers)
 PRE_BUFFER_S = 0.40           # audio kept before speech starts (word onsets)
-SEGMENT_END_SILENCE_S = 0.85  # silence that closes a segment (latency vs mid-phrase chopping)
-SPLIT_SOFT_S = 6.0            # start hunting for a word gap to split long speech (paste cadence)
+SEGMENT_END_SILENCE_S = 1.0   # silence that closes a segment (triggers decode; high enough to ride over mid-phrase pauses)
+SPLIT_SOFT_S = 10.0           # start hunting for a word gap to split long speech
 SPLIT_HARD_S = 14.0           # cut by now even mid-word, at the quietest recent window
 SPLIT_DIP_WINDOWS = 2         # consecutive quiet windows that count as a word gap (~64ms)
 SPLIT_LOOKBACK_S = 1.5        # window searched for the quietest cut point on hard split
@@ -83,20 +83,16 @@ def type_text(text):
 
 
 paste_lock = threading.Lock()  # copy+paste must be atomic vs clipboard restore
-flush_lock = threading.Lock()  # flush+enter sequences run in submission order
 
 
 def paste_now(text):
-    """wl-copy + paste keystroke as one atomic unit (paste_lock held).
-    Paste key is Shift+Insert: this machine's keymap turns an injected
-    Ctrl+V into Ctrl+Escape, which fired the discard bind after every
-    paste and killed live sessions (verified 2026-09-07 22:24)."""
+    """wl-copy + paste keystroke as one atomic unit (paste_lock held)."""
     subprocess.run(["wl-copy", text], check=True)
     cls = focused_window_class()
     if cls in TERMINAL_CLASSES:
         wtype("-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl")
     else:
-        wtype("-M", "shift", "-k", "Insert", "-m", "shift")
+        wtype("-M", "ctrl", "-k", "v", "-m", "ctrl")
     return cls
 
 
@@ -206,21 +202,8 @@ def apply_one_word_filter(text):
 
 
 SKILL_DIRS = ("~/.agents/skills", "~/.zcode/skills")
-SKILL_WORDS_PATH = os.path.expanduser("~/.config/dictationd/skills-words.json")
 SLASH_WORD = "slash"
 SLASH_RATIO = 0.8  # fuzzy floor for matching a spoken name to a real skill
-
-
-def load_skill_words():
-    """Skill spoken-aliases: {"<skill name>": ["alias", ...]}. Aliases match
-    ONLY after "slash" (commands stay commands, normal language untouched)."""
-    try:
-        with open(SKILL_WORDS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return {k.lower(): [a.lower() for a in v] for k, v in data.items()
-                if isinstance(v, list)}
-    except Exception:
-        return {}
 
 
 def load_slash_skills():
@@ -261,12 +244,6 @@ def apply_slash_commands(text):
     skills = load_slash_skills()
     if not skills:
         return text
-    # alias -> canonical (aliases match only in the slash position)
-    alias_map = {}
-    for skill, aliases in load_skill_words().items():
-        if skill in skills:
-            for a in aliases:
-                alias_map[a] = skill
     out, i = [], 0
     while i < len(tokens):
         core = tokens[i].strip('.,!?;:"').lower()
@@ -277,9 +254,6 @@ def apply_slash_commands(text):
                     break
                 spoken = "".join(tokens[i + 1 + j].strip('.,!?;:"').lower()
                                  for j in range(n))
-                if spoken in alias_map:
-                    hit, span = alias_map[spoken], n
-                    break
                 m = match_skill(spoken, skills)
                 if m:
                     hit, span = m, n
@@ -616,8 +590,8 @@ def _finalize(s, auto_enter):
         wtype("-k", "Return")
 
 
-def flushenter_live(enter=True):
-    """LIVE mode: decode + paste everything pending (+ Enter if send), keep
+def flushenter_live():
+    """LIVE mode: decode + paste everything pending + press Enter, keep
     recording so the next phrase starts with zero latency."""
     with state_lock:
         s = session
@@ -625,47 +599,16 @@ def flushenter_live(enter=True):
             return "not-live"
         windows = s.windows
         s.windows = []
-        s.win_energy = []
         s.silence_run = 0
 
     def _flush():
-        global LAST_FLUSH_TS
-        with flush_lock:  # order matters: an earlier chunk must paste before a later Enter
-            text = decode_windows(windows, source="live-flush")
-            LAST_FLUSH_TS = time.monotonic()
-            if text:
-                paste_text(text + " ")
-            if enter:
-                wtype("-k", "Return")
+        text = decode_windows(windows, source="live-flushenter")
+        if text:
+            paste_text(text + " ")
+        wtype("-k", "Return")
 
     threading.Thread(target=_flush, daemon=True).start()
     return "flushing"
-
-
-LAST_FLUSH_TS = 0.0            # guard: macro keys chain ctrl+esc after grave
-DISCARD_GUARD_S = 1.5
-
-
-def discard_session():
-    """Graceful bail for ALL modes: stop without decoding/pasting/sending.
-    Ignores discards that arrive right after a flush — the user's macro key
-    chains ctrl+esc behind grave, and without the guard every flush would
-    also kill the session."""
-    global session, LAST_FLUSH_TS
-    if time.monotonic() - LAST_FLUSH_TS < DISCARD_GUARD_S:
-        log("discard ignored (within guard window after flush)")
-        return "guarded"
-    with state_lock:
-        s = session
-        session = None
-    if s is None:
-        return "idle"
-    try:
-        s.mic.stop()
-    except Exception:
-        pass
-    log(f"session discarded: {s.mode} ({len(s.windows)} windows dropped)")
-    return "discarded"
 
 
 def flush_segment():
@@ -708,12 +651,8 @@ def handle(cmd):
         if cur == SEND:
             return flush_segment()
         if cur == LIVE:
-            return flushenter_live(enter=True)  # flush + send + keep live
+            return stop_session(auto_enter=False)
         return start_session(LIVE)
-    if cmd == "flushlive":
-        return flushenter_live(enter=False)  # flush + paste, no send
-    if cmd == "discard":
-        return discard_session()
     if cmd == "flushenter":
         return flushenter_live()
     if cmd == "status":
@@ -883,11 +822,6 @@ def serve():
             try:
                 data = conn.recv(256).decode().strip()
                 if data:
-                    import struct
-                    pid = struct.unpack("3i", conn.getsockopt(
-                        socket.SOL_SOCKET, 17, 12))[0]  # SO_PEERCRED
-                    if data != "status":
-                        log("cmd:", data, "from pid", pid)
                     conn.sendall(handle(data).encode())
             except Exception as e:
                 log("conn error:", e)
