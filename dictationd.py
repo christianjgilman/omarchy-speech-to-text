@@ -201,6 +201,73 @@ def apply_one_word_filter(text):
     return text
 
 
+SKILL_DIRS = ("~/.agents/skills", "~/.zcode/skills")
+SLASH_WORD = "slash"
+SLASH_RATIO = 0.8  # fuzzy floor for matching a spoken name to a real skill
+
+
+def load_slash_skills():
+    """Live skill names (refreshed every decode; globbing two dirs is cheap)."""
+    names = set()
+    for d in SKILL_DIRS:
+        base = os.path.expanduser(d)
+        try:
+            for entry in os.listdir(base):
+                if entry[0].isalnum() and os.path.isdir(os.path.join(base, entry)):
+                    names.add(entry.lower())
+        except OSError:
+            continue
+    return names
+
+
+def match_skill(spoken, skills):
+    """Exact match always wins; otherwise fuzzy >= SLASH_RATIO for real tries."""
+    if spoken in skills:
+        return spoken
+    if len(spoken) < 4:
+        return None
+    best, best_r = None, 0.0
+    for s in skills:
+        r = difflib.SequenceMatcher(None, spoken, s).ratio()
+        if r > best_r:
+            best, best_r = s, r
+    return best if best_r >= SLASH_RATIO else None
+
+
+def apply_slash_commands(text):
+    """Spoken commands: "slash speech" -> "/speech". The name after "slash"
+    must match a real zcode skill (1-3 tokens joined, kebab-aware), otherwise
+    the text is left alone. "slash" never converts to "/" by itself."""
+    tokens = text.split(" ")
+    if SLASH_WORD not in [t.lower().strip('.,!?;:"') for t in tokens]:
+        return text
+    skills = load_slash_skills()
+    if not skills:
+        return text
+    out, i = [], 0
+    while i < len(tokens):
+        core = tokens[i].strip('.,!?;:"').lower()
+        if core == SLASH_WORD and i + 1 < len(tokens):
+            hit, span = None, 0
+            for n in (1, 2, 3):
+                if i + n > len(tokens):
+                    break
+                spoken = "".join(tokens[i + 1 + j].strip('.,!?;:"').lower()
+                                 for j in range(n))
+                m = match_skill(spoken, skills)
+                if m:
+                    hit, span = m, n
+                    break
+            if hit:
+                log("slash-command:", "/{}".format(hit))
+                out.append("/" + hit)
+                i += 1 + span  # "slash" + the name tokens
+                continue
+        out.append(tokens[i])
+        i += 1
+    return " ".join(out)
+
+
 def apply_custom_words(text):
     """Two layers:
     1. exact replacements (heard -> write), case-insensitive, longest first;
@@ -208,6 +275,7 @@ def apply_custom_words(text):
        fuzzy-matched to the target, so you can add names without knowing what
        the recognizer mangles them into."""
     text = apply_one_word_filter(text)
+    text = apply_slash_commands(text)
     words = load_custom_words()
     if not text or not words:
         return text
