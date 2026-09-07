@@ -38,9 +38,13 @@ SAMPLE_RATE = 16000
 VAD_THRESHOLD = 0.50         # silero speech probability gate (lower = hears soft fillers, higher = ignores music; ghost single-words are caught by the one-word filter)
 MIN_SPEECH_MS = 120           # discard blips shorter than this (kept low: soft fillers)
 PRE_BUFFER_S = 0.40           # audio kept before speech starts (word onsets)
-SEGMENT_END_SILENCE_S = 0.7   # silence that closes a segment (triggers decode)
-MAX_SEGMENT_S = 10.0          # force a segment break on very long continuous speech
+SEGMENT_END_SILENCE_S = 1.0   # silence that closes a segment (triggers decode; high enough to ride over mid-phrase pauses)
+SPLIT_SOFT_S = 10.0           # start hunting for a word gap to split long speech
+SPLIT_HARD_S = 14.0           # cut by now even mid-word, at the quietest recent window
+SPLIT_DIP_WINDOWS = 2         # consecutive quiet windows that count as a word gap (~64ms)
+SPLIT_LOOKBACK_S = 1.5        # window searched for the quietest cut point on hard split
 FUZZY_WORD_RATIO = 0.72       # vocab entries: near-miss transcript words corrected to the target
+ONE_WORD_WHITELIST = {"launch", "go", "approved", "bro", "it's", "i'm", "don't", "can't", "won't", "you're", "we're", "they're", "isn't", "doesn't", "didn't", "c", "ci"}  # single-word segments kept only if in this set (lowercase)
 HTTP_HOST = "127.0.0.1"       # OpenAI-compatible STT endpoint (local only)
 HTTP_PORT = 8765
 LIVE = "live"
@@ -188,18 +192,33 @@ def save_custom_words(words):
         json.dump({"replacements": words}, f, ensure_ascii=False, indent=1)
 
 
+def apply_one_word_filter(text):
+    """Drop one-word segments unless whitelisted (music/ghost artifacts
+    surface as lone words; real commands are whitelisted)."""
+    if text and len(text.split()) == 1 and text.lower().strip(".,!?;:") not in ONE_WORD_WHITELIST:
+        log("dropped one-word segment:", text)
+        return ""
+    return text
+
+
 def apply_custom_words(text):
     """Two layers:
     1. exact replacements (heard -> write), case-insensitive, longest first;
     2. vocabulary entries (write-only): near-miss transcript words/phrases
        fuzzy-matched to the target, so you can add names without knowing what
        the recognizer mangles them into."""
+    text = apply_one_word_filter(text)
     words = load_custom_words()
     if not text or not words:
         return text
     for w in sorted([w for w in words if w.get("from")],
                     key=lambda w: len(w["from"]), reverse=True):
-        text = re.sub(re.escape(w["from"]), w["to"], text, flags=re.IGNORECASE)
+        # whole-word only: a short "from" ("c") must never fire inside a
+        # real word ("appreciate")
+        pattern = r"(?<!\w)" + re.escape(w["from"]) + r"(?!\w)"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            log("custom-word:", w["from"], "->", w["to"])
+        text = re.sub(pattern, w["to"], text, flags=re.IGNORECASE)
 
     vocab = [w["to"].strip() for w in words if not w.get("from") and len(w["to"].strip()) >= 4]
     if not vocab:
@@ -214,15 +233,20 @@ def apply_custom_words(text):
         while i < len(tokens):
             core = tokens[i].strip('.,!?;:"').lower()
             if n == 1:
-                # single-token match, plus a two-token window: the recognizer
-                # often splits one spoken word into pieces ("shao ting")
-                hit = len(core) >= 4 and difflib.SequenceMatcher(None, core, t_lower).ratio() >= FUZZY_WORD_RATIO
+                # two-token window first ("moto gp"), then single token
+                # ("valen"); single-token first would eat half of the
+                # bigram ("MotoGP gp") and leave a stray token behind.
+                hit = False
                 span = 1
-                if not hit and i + 1 < len(tokens):
+                if i + 1 < len(tokens):
                     nxt = tokens[i + 1].strip('.,!?;:"').lower()
                     bigram = core + nxt
-                    hit = (t_lower not in bigram) and len(bigram) >= 6 and difflib.SequenceMatcher(None, bigram, t_compact).ratio() >= FUZZY_WORD_RATIO
-                    span = 2
+                    if (bigram == t_compact or (t_lower not in bigram and len(bigram) >= 6)) and difflib.SequenceMatcher(None, bigram, t_compact).ratio() >= FUZZY_WORD_RATIO:
+                        hit = True
+                        span = 2
+                if not hit:
+                    hit = len(core) >= 4 and difflib.SequenceMatcher(None, core, t_lower).ratio() >= FUZZY_WORD_RATIO
+                    span = 1
             else:
                 window = tokens[i:i + n]
                 if len(window) < n:
@@ -232,6 +256,7 @@ def apply_custom_words(text):
                 hit = len(cand) >= 6 and difflib.SequenceMatcher(None, cand, t_compact).ratio() >= FUZZY_WORD_RATIO
                 span = n
             if hit:
+                log("vocab:", " ".join(tokens[i:i + span]), "->", target)
                 tokens[i:i + span] = [target]
                 i += span
                 continue
@@ -240,7 +265,16 @@ def apply_custom_words(text):
     return " ".join(tokens)
 
 
-def decode_windows(windows):
+def log_transcript(text, source):
+    """Append every decoded phrase to one JSONL log for later analysis."""
+    import datetime, json
+    entry = {"ts": datetime.datetime.now().isoformat(timespec="seconds"),
+             "source": source, "text": text}
+    with open(os.path.expanduser("~/.local/share/dictationd/transcripts.jsonl"), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def decode_windows(windows, source="dictation"):
     """Offline-decode concatenated float32 windows; returns styled text."""
     if not windows:
         return ""
@@ -251,7 +285,13 @@ def decode_windows(windows):
         s = rec.create_stream()
         s.accept_waveform(SAMPLE_RATE, audio.tolist())
         rec.decode_stream(s)
-        return apply_custom_words(s.result.text.strip())
+        text = apply_custom_words(s.result.text.strip())
+    if text:
+        try:
+            log_transcript(text, source)
+        except OSError as e:
+            log("transcript log write failed:", e)
+    return text
 
 
 class Session:
@@ -461,13 +501,34 @@ def _finalize(s, auto_enter):
         s.windows.append(s.queue.popleft())
     s.mic.stop()
     log(f"session stop: {s.mode}")
-    text = decode_windows(s.windows)
+    text = decode_windows(s.windows, source=f"{s.mode}-tail")
     if text:
         s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
     if s.pending_text:
         paste_text(s.pending_text)
     if auto_enter:
         wtype("-k", "Return")
+
+
+def flushenter_live():
+    """LIVE mode: decode + paste everything pending + press Enter, keep
+    recording so the next phrase starts with zero latency."""
+    with state_lock:
+        s = session
+        if s is None or s.mode != LIVE:
+            return "not-live"
+        windows = s.windows
+        s.windows = []
+        s.silence_run = 0
+
+    def _flush():
+        text = decode_windows(windows, source="live-flushenter")
+        if text:
+            paste_text(text + " ")
+        wtype("-k", "Return")
+
+    threading.Thread(target=_flush, daemon=True).start()
+    return "flushing"
 
 
 def flush_segment():
@@ -485,7 +546,7 @@ def flush_segment():
     s.silence_run = 0
 
     def _flush():
-        text = decode_windows(windows)
+        text = decode_windows(windows, source=f"{s.mode}-flush")
         if text:
             s.pending_text = (s.pending_text + " " + text) if s.pending_text else text
             paste_text(s.pending_text + " ")
@@ -601,11 +662,14 @@ class SttHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "bad json"})
                 return
             frm, to = str(item.get("from", "")).strip(), str(item.get("to", "")).strip()
-            if not frm or not to:
-                self._json(400, {"error": "from and to are required"})
+            if not to or (frm and frm.lower() == to.lower()):
+                self._json(400, {"error": "to is required (from optional)"})
                 return
             words = load_custom_words()
-            words = [w for w in words if w["from"].lower() != frm.lower()]
+            if frm:
+                words = [w for w in words if (w.get("from") or "").lower() != frm.lower()]
+            else:
+                words = [w for w in words if w.get("to") != to]
             words.append({"from": frm, "to": to})
             save_custom_words(words)
             self._json(200, {"ok": True, "words": words})
@@ -618,7 +682,7 @@ class SttHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "bad json"})
                 return
             frm = str(item.get("from", "")).strip().lower()
-            words = [w for w in load_custom_words() if w["from"].lower() != frm]
+            words = [w for w in load_custom_words() if (w.get("from") or "").lower() != frm]
             save_custom_words(words)
             self._json(200, {"ok": True, "words": words})
             return
@@ -641,6 +705,11 @@ class SttHandler(BaseHTTPRequestHandler):
                 stream.accept_waveform(SAMPLE_RATE, pcm.tolist())
                 rec.decode_stream(stream)
                 text = apply_custom_words(stream.result.text.strip())
+            if text:
+                try:
+                    log_transcript(text, "api")
+                except OSError as e:
+                    log("transcript log write failed:", e)
             self._json(200, {"text": text})
         except Exception as e:
             log("http error:", e)
