@@ -44,7 +44,7 @@ SPLIT_HARD_S = 14.0           # cut by now even mid-word, at the quietest recent
 SPLIT_DIP_WINDOWS = 2         # consecutive quiet windows that count as a word gap (~64ms)
 SPLIT_LOOKBACK_S = 1.5        # window searched for the quietest cut point on hard split
 FUZZY_WORD_RATIO = 0.72       # vocab entries: near-miss transcript words corrected to the target
-ONE_WORD_WHITELIST = {"launch", "go", "approved", "bro", "it's", "i'm", "don't", "can't", "won't", "you're", "we're", "they're", "isn't", "doesn't", "didn't", "c", "ci"}  # single-word segments kept only if in this set (lowercase)
+ONE_WORD_WHITELIST = {"launch", "go", "approved", "bro", "it's", "i'm", "don't", "can't", "won't", "you're", "we're", "they're", "isn't", "doesn't", "didn't", "c", "ci", "yes", "no", "okay", "basically", "thinking"}  # single-word segments kept only if in this set (lowercase); "yeah" stays OUT (music ghost)
 HTTP_HOST = "127.0.0.1"       # OpenAI-compatible STT endpoint (local only)
 HTTP_PORT = 8765
 LIVE = "live"
@@ -275,7 +275,13 @@ def apply_custom_words(text):
        fuzzy-matched to the target, so you can add names without knowing what
        the recognizer mangles them into."""
     text = apply_one_word_filter(text)
-    text = apply_slash_commands(text)
+    # corrections BEFORE slash conversion: "slash omarty" must become
+    # "slash Omarchy" first, or the slash layer bakes the mangled form
+    # ("/omarty") into a path the exact layer can never reach
+    text = apply_corrections(text)
+    return apply_slash_commands(text)
+def apply_corrections(text):
+    """Exact heard-form replacements first, then fuzzy vocab near-misses."""
     words = load_custom_words()
     if not text or not words:
         return text
@@ -448,10 +454,13 @@ def deliver(s, text, source):
 
 def emit_segment(s, force=False):
     """Close the open segment: decode its audio and clear it."""
-    text = decode_windows(s.windows, source=s.mode)
-    s.windows = []
-    s.win_energy = []
-    s.silence_run = 0
+    # take the windows under the lock: a flush command decoding the same
+    # segment concurrently would bank the same text twice (double paste)
+    with state_lock:
+        windows, s.windows = s.windows, []
+        s.win_energy = []
+        s.silence_run = 0
+    text = decode_windows(windows, source=s.mode)
     deliver(s, text, s.mode)
 
 
@@ -459,10 +468,11 @@ def split_segment(s, cut):
     """Best-cut a long segment at a word boundary: decode the head, keep the
     tail (and its energies) as the start of the next segment. Speech continues
     without the gate re-arming, so the flow never stutters."""
-    head, tail = s.windows[:cut], s.windows[cut:]
-    ehead, etail = s.win_energy[:cut], s.win_energy[cut:]
-    s.windows, s.win_energy = tail, etail
-    s.silence_run = 0
+    with state_lock:
+        head, tail = s.windows[:cut], s.windows[cut:]
+        ehead, etail = s.win_energy[:cut], s.win_energy[cut:]
+        s.windows, s.win_energy = tail, etail
+        s.silence_run = 0
     text = decode_windows(head, source=f"{s.mode}-split")
     deliver(s, text, s.mode)
 
@@ -620,12 +630,14 @@ def flush_segment(enter=False):
         if s is None or s.mode != SEND:
             log(f"flush: not in send mode (session={s.mode if s else None})")
             return "not-send"
-        open_windows = len(s.windows)
+        # take the open windows INSIDE the lock: stealing them unlocked let the
+        # worker's own emit decode the same audio, banking it twice (double paste)
+        windows = s.windows
+        s.windows = []
+        s.silence_run = 0
+        open_windows = len(windows)
         banked = len(s.pending_text)
     log(f"flush: open_windows={open_windows} banked_chars={banked}")
-    windows = s.windows
-    s.windows = []
-    s.silence_run = 0
 
     def _flush():
         text = decode_windows(windows, source=f"{s.mode}-flush") if windows else ""
