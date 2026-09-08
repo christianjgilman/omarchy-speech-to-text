@@ -703,7 +703,9 @@ def handle(cmd):
             return flush_segment()
         if cur == LIVE:
             return stop_session(auto_enter=False)
-        return start_session(LIVE)
+        # idle: no longer starts a live session (user retired live mode
+        # 2026-09-08); ctrl+tab is the only session starter now
+        return "idle"
     if cmd == "flushenter":
         return flushenter_live()
     if cmd == "status":
