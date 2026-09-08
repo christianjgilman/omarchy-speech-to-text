@@ -630,16 +630,43 @@ def flush_segment(enter=False):
         if s is None or s.mode != SEND:
             log(f"flush: not in send mode (session={s.mode if s else None})")
             return "not-send"
-        # take the open windows INSIDE the lock: stealing them unlocked let the
-        # worker's own emit decode the same audio, banking it twice (double paste)
-        windows = s.windows
-        s.windows = []
-        s.silence_run = 0
-        open_windows = len(windows)
-        banked = len(s.pending_text)
-    log(f"flush: open_windows={open_windows} banked_chars={banked}")
 
     def _flush():
+        # the tail of the last phrase can still be in flight when the key
+        # lands (mic callback buffer not yet delivered): wait for the queue
+        # to go quiet so this flush carries it. The quiet period also rides
+        # out a worker decode (queue backs up while it runs). Bounded so a
+        # flush pressed mid-speech never stalls
+        empty = 0
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            with state_lock:
+                if s is not session:
+                    return
+                if not s.queue:
+                    empty += 1
+                    if empty >= 8:  # ~80ms of silence: mic buffer fully delivered
+                        break
+                else:
+                    empty = 0
+            time.sleep(0.01)
+        with state_lock:
+            if s is not session:
+                return
+            # take windows + queue INSIDE the lock: stealing them unlocked let
+            # the worker's own emit decode the same audio, banking it twice
+            # (double paste). The queue may hold the whole last phrase when
+            # the worker is busy decoding an earlier split; if it is left
+            # there, it decodes on the NEXT flush instead of this one
+            windows = s.windows
+            s.windows = []
+            while s.queue:
+                windows.append(s.queue.popleft())
+            s.silence_run = 0
+            open_windows = len(windows)
+            banked = len(s.pending_text)
+        log(f"flush: open_windows={open_windows} banked_chars={banked}")
+
         text = decode_windows(windows, source=f"{s.mode}-flush") if windows else ""
         with state_lock:
             if text:
