@@ -381,6 +381,9 @@ class Session:
         self.prebuf = collections.deque(maxlen=int(PRE_BUFFER_S * SAMPLE_RATE / vad_window))
         self.silence_run = 0
         self.queue = collections.deque()
+        self.inflight = None          # window popped by the worker, decode not
+                                      # finished: flush waits on this or the
+                                      # tail banks for the NEXT flush
         self.mic = None
 
 
@@ -483,30 +486,36 @@ def worker():
         s = session
         win = None
         if s is not None:
-            if s.queue:
-                win = s.queue.popleft()
-            else:
-                time.sleep(0.01)
+            # pop + mark inflight under the same lock the flush checks, so a
+            # flush can never see an empty queue + no inflight while a window
+            # is actually mid-decode
+            with state_lock:
+                if s.queue:
+                    win = s.inflight = s.queue.popleft()
+        if win is None:
+            time.sleep(0.01 if s is not None else 0.05)
+            continue
+        try:
+            try:
+                is_speech = vad.is_speech(win.tolist())
+            except Exception as e:
+                log("vad error:", e)
                 continue
-        else:
-            time.sleep(0.05)
-            continue
-        try:
-            is_speech = vad.is_speech(win.tolist())
-        except Exception as e:
-            log("vad error:", e)
-            continue
 
-        # one bad window or a bug in a new feature must NEVER kill the
-        # pipeline: a dead worker black-holes all dictation until restart
-        # (happened 2026-09-07: slash-command IndexError silenced live mode
-        # mid-session, words only surfaced on session stop)
-        try:
-            worker_step(s, win, is_speech)
-        except Exception as e:
-            import traceback
-            log("worker step error:", e)
-            traceback.print_exc()
+            # one bad window or a bug in a new feature must NEVER kill the
+            # pipeline: a dead worker black-holes all dictation until restart
+            # (happened 2026-09-07: slash-command IndexError silenced live mode
+            # mid-session, words only surfaced on session stop)
+            try:
+                worker_step(s, win, is_speech)
+            except Exception as e:
+                import traceback
+                log("worker step error:", e)
+                traceback.print_exc()
+        finally:
+            with state_lock:
+                if s.inflight is win:
+                    s.inflight = None
 
 def worker_step(s, win, is_speech):
         if not s.speech_seen:
@@ -633,22 +642,32 @@ def flush_segment(enter=False):
 
     def _flush():
         # the tail of the last phrase can still be in flight when the key
-        # lands (mic callback buffer not yet delivered): wait for the queue
-        # to go quiet so this flush carries it. The quiet period also rides
-        # out a worker decode (queue backs up while it runs). Bounded so a
-        # flush pressed mid-speech never stalls
+        # lands: windows not yet delivered (queue) or a window the worker is
+        # mid-decode on (s.inflight, marked atomically with its pop). Wait
+        # for BOTH to drain, then steal under the lock. Bounded: a flush
+        # pressed mid-speech renders after 0.25s like before, and a stuck
+        # decode can never hold the paste past the hard cap
         empty = 0
-        deadline = time.monotonic() + 0.25
-        while time.monotonic() < deadline:
+        start = time.monotonic()
+        while True:
+            now = time.monotonic()
             with state_lock:
                 if s is not session:
                     return
-                if not s.queue:
+                busy = s.inflight is not None
+                if not s.queue and not busy:
                     empty += 1
                     if empty >= 8:  # ~80ms of silence: mic buffer fully delivered
                         break
                 else:
                     empty = 0
+                # mid-speech (queue still filling) keeps the old 0.25s cap;
+                # a finished tail riding in a decode waits for it (normally
+                # sub-second) so nothing is left banked for the next flush
+                if now - start >= 0.25 and not busy:
+                    break
+                if now - start >= 2.5:
+                    break
             time.sleep(0.01)
         with state_lock:
             if s is not session:
